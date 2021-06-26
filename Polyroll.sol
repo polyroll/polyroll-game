@@ -8,13 +8,18 @@ import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/release-v3.1
 pragma solidity 0.6.12;
 
 // Polyroll is the contract that governs the 3 games at Polyroll.org: coin flip, dice roll, and polyroll.
+/*
+v2 updates:
+- Detailed BetSettled event log so that website can query archival RPC node using event filters (filter by gambler address, game type, or betId)
+- Compute cumulativeDeposit and cumulativeWithdrawal for all top ups & withdrawal to easily calculate casino profitability.
+*/
 contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // Chainlink VRF related parameters
-    address constant LINK_TOKEN = 0xb0897686c545045aFc77CF20eC7A532E3120E0F1;
-    address public VRF_COORDINATOR = 0x3d2341ADb2D31f1c5530cDC622016af293177AE0;
-    bytes32 public KEY_HASH = 0xf86195cf7690c55907b2b611ebb7343a6f649bff128701cc542f0569e2c549da;
+    address public constant LINK_TOKEN = 0xb0897686c545045aFc77CF20eC7A532E3120E0F1;
+    address public constant VRF_COORDINATOR = 0x3d2341ADb2D31f1c5530cDC622016af293177AE0;
+    bytes32 public constant KEY_HASH = 0xf86195cf7690c55907b2b611ebb7343a6f649bff128701cc542f0569e2c549da;
     uint public chainlinkFee = 100000000000000; // 0.0001 LINK
 
     // Each bet is deducted 1% in favor of the house
@@ -24,6 +29,7 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
     //  2 for coin flip
     //  6 for dice roll
     //  6*6 = 36 for double dice
+    //  37 for roulette
     //  100 for polyroll
     uint constant MAX_MODULO = 100;
 
@@ -45,6 +51,10 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
     uint constant POPCNT_MASK = 0x0001041041041041041041041041041041041041041041041041041041041041;
     uint constant POPCNT_MODULO = 0x3F;
 
+    // Sum of all historical deposits and withdrawals. Used for calculating profitability. Profit = Balance - cumulativeDeposit + cumulativeWithdrawal
+    uint public cumulativeDeposit;
+    uint public cumulativeWithdrawal;
+
     // In addition to house edge, wealth tax is added every time the bet amount exceeds a multiple of a threshold.
     // For example, if wealthTaxIncrementThreshold = 3000 ether,
     // A bet amount of 3000 ether will have a wealth tax of 1% in addition to house edge.
@@ -54,10 +64,10 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
 
     // The minimum and maximum bets.
     uint public minBetAmount = 1 ether;
-    uint public maxBetAmount = 20 ether;
+    uint public maxBetAmount = 100 ether;
 
-    // Adjustable max bet profit. Used to cap bets against dynamic odds.
-    uint public maxProfit = 3000000 ether;
+    // max bet profit. Used to cap bets against dynamic odds.
+    uint public maxProfit = 3000 ether;
 
     // Funds that are locked in potentially winning bets. Prevents contract from committing to new bets that it cannot pay out.
     uint public lockedInBets;
@@ -98,15 +108,19 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
 
     // Events
     event BetPlaced(uint indexed betId, address indexed gambler);
-    event BetSettled(uint indexed betId, address indexed gambler, uint winAmount);
+    event BetSettled(uint indexed betId, address indexed gambler, uint amount, uint8 indexed modulo, uint8 rollUnder, uint40 mask, uint outcome, uint winAmount);
     event BetRefunded(uint indexed betId, address indexed gambler);
 
     // Constructor. Using Chainlink VRFConsumerBase constructor.
     constructor() VRFConsumerBase(VRF_COORDINATOR, LINK_TOKEN) public {}
 
-    // Fallback payable function deliberately left empty. It is used to top up the bank roll.
-    fallback() external payable {}
-    receive() external payable {}
+    // Fallback payable function used to top up the bank roll.
+    fallback() external payable {
+        cumulativeDeposit += msg.value;
+    }
+    receive() external payable {
+        cumulativeDeposit += msg.value;
+    }
 
     // See ETH balance.
     function balance() external view returns (uint) {
@@ -118,20 +132,20 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
         chainlinkFee = _chainlinkFee;
     }
 
-    // Set min bet amount. minBetAmount should be large enough such that its house edge fee can cover the settlement gas fee and oracle fee.
+    // Set min bet amount. minBetAmount should be large enough such that its house edge fee can cover the Chainlink oracle fee.
     function setMinBetAmount(uint _minBetAmount) external onlyOwner {
         minBetAmount = _minBetAmount;
     }
 
     // Set max bet amount.
     function setMaxBetAmount(uint _maxBetAmount) external onlyOwner {
-        require (_maxBetAmount < 300000 ether, "maxBetAmount must be a sane number");
+        require (_maxBetAmount < 5000000 ether, "maxBetAmount must be a sane number");
         maxBetAmount = _maxBetAmount;
     }
 
     // Set max bet reward. Setting this to zero effectively disables betting.
     function setMaxProfit(uint _maxProfit) external onlyOwner {
-        require (_maxProfit < 300000 ether, "maxProfit must be a sane number");
+        require (_maxProfit < 50000000 ether, "maxProfit must be a sane number");
         maxProfit = _maxProfit;
     }
 
@@ -145,11 +159,12 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
         wealthTaxIncrementThreshold = _wealthTaxIncrementThreshold;
     }
 
-    // Owner can withdraw funds not exceeding contract balance minus potential win prizes
+    // Owner can withdraw funds not exceeding balance minus potential win prizes by open bets
     function withdrawFunds(address payable beneficiary, uint withdrawAmount) external onlyOwner {
         require (withdrawAmount <= address(this).balance, "Withdrawal amount larger than balance.");
         require (withdrawAmount <= address(this).balance - lockedInBets, "Withdrawal amount larger than balance minus lockedInBets");
         beneficiary.transfer(withdrawAmount);
+        cumulativeWithdrawal += withdrawAmount;
     }
 
     // Place bet
@@ -181,7 +196,7 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
         // Winning amount.
         uint possibleWinAmount = getDiceWinAmount(amount, modulo, rollUnder);
 
-        // Enforce max profit limit.
+        // Enforce max profit limit. Bet will not be placed if condition is not met.
         require (possibleWinAmount <= amount + maxProfit, "maxProfit limit violation.");
 
         // Check whether contract has enough funds to accept this bet.
@@ -274,7 +289,7 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
         }
         
         // Record bet settlement in event log.
-        emit BetSettled(betId, gambler, winAmount);
+        emit BetSettled(betId, gambler, amount, uint8(modulo), uint8(rollUnder), bet.mask, outcome, winAmount);
 
         // Unlock possibleWinAmount from lockedInBets, regardless of the outcome.
         lockedInBets -= possibleWinAmount;
@@ -286,11 +301,13 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
         bet.outcome = outcome;
 
         // Send win amount to gambler.
-        gambler.transfer(winAmount == 0 ? 1 wei : winAmount);
+        if (winAmount > 0) {
+            gambler.transfer(winAmount);
+        }
     }
 
 
-    // Return the bet if it was not settled.
+    // Return the bet in extremely unlikely scenario it was not settled by Chainlink VRF. 
     // In case you ever find yourself in a situation like this, just contact Polyroll support.
     // However, nothing precludes you from calling this method yourself.
     function refundBet(uint betId) external nonReentrant payable {
@@ -301,9 +318,7 @@ contract Polyroll is VRFConsumerBase, Ownable, ReentrancyGuard {
         // Validation check
         require (amount > 0, "Bet does not exist."); // Check that bet exists
         require (bet.isSettled == false, "Bet is settled already."); // Check that bet is still open
-
-        // Bet can only be refunded after 600 blocks (~20 minutes).
-        require (block.number > bet.placeBlockNumber + 600, "Wait 600 blocks after placing bet before requesting refund.");
+        require (block.number > bet.placeBlockNumber + 43200, "Wait after placing bet before requesting refund.");
 
         uint possibleWinAmount = getDiceWinAmount(amount, bet.modulo, bet.rollUnder);
 
